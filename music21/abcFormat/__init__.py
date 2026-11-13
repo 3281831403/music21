@@ -6,7 +6,7 @@
 #               Michael Scott Asato Cuthbert
 #               Dylan J. Nagler
 #
-# Copyright:    Copyright © 2010-22 Michael Scott Asato Cuthbert
+# Copyright:    Copyright © 2010-2026 Michael Scott Asato Cuthbert
 # License:      BSD, see license.txt
 # ------------------------------------------------------------------------------
 '''
@@ -145,6 +145,11 @@ reChordSymbol = re.compile('"[^"]*"')  # non-greedy
 reChord = re.compile('[.*?]')  # non-greedy
 reAbcVersion = re.compile(r'%abc-(\d+)\.(\d+)\.?(\d+)?')
 reDirective = re.compile(r'^%%([a-z\-]+)\s+(\S+)(.*)')
+# An inline information field, such as [K:F] or [M:3/4 L:1/8], as defined
+# by ABC v2.1 section 3.2. One or more uppercase-tagged fields may share a
+# pair of square brackets. Data may contain spaces (e.g. Q:1/4=60, K:G dorian)
+# and quoted text, but no nested square brackets.
+reInlineMetadataFields = re.compile(r'\[((?:[A-Z]:[^[\]]*)(?:\s+[A-Z]:[^[\]]*)*)\]')
 
 
 # ------------------------------------------------------------------------------
@@ -2168,6 +2173,48 @@ class ABCHandler:
             return True
         return False
 
+    @staticmethod
+    def _splitInlineFieldDefs(innerSrc: str) -> list[str]:
+        # Split the inner text at each uppercase tag that introduces a field.
+        fieldStarts: list[int] = []
+        for fieldIndex, char in enumerate(innerSrc):
+            if (char.isupper() and innerSrc[fieldIndex + 1:fieldIndex + 2] == ':'
+                    and (fieldIndex == 0 or innerSrc[fieldIndex - 1] == ' ')):
+                fieldStarts.append(fieldIndex)
+        fieldDefs: list[str] = []
+        for fieldNumber, fieldStart in enumerate(fieldStarts):
+            if fieldNumber + 1 < len(fieldStarts):
+                fieldEnd = fieldStarts[fieldNumber + 1]
+            else:
+                fieldEnd = len(innerSrc)
+            fieldDefs.append(innerSrc[fieldStart:fieldEnd].strip())
+        return fieldDefs
+
+    @staticmethod
+    def inlineMetadataFields(strSrc: str, pos: int) -> list[str]|None:
+        '''
+        If the square-bracket expression beginning at `pos` in `strSrc` is an
+        inline information field (ABC v2.1, section 3.2), return the list of
+        field definitions found inside it; otherwise return None so that the
+        expression can be treated as a chord, e.g. ``[ce]``.
+
+        A field starts with a capital letter followed by a colon; one bracket
+        group may hold several fields at once, such as ``[M:3/4 L:1/8]``.
+
+        >>> ABCHandler.inlineMetadataFields('AB[K:F]cd', 2)
+        ['K:F']
+        >>> ABCHandler.inlineMetadataFields('AB[M:3/4 L:1/8]cd', 2)
+        ['M:3/4', 'L:1/8']
+        >>> ABCHandler.inlineMetadataFields('AB[ce]cd', 2) is None
+        True
+
+        * New in v11.
+        '''
+        fieldMatch = reInlineMetadataFields.match(strSrc, pos)
+        if fieldMatch is None:
+            return None
+        return ABCHandler._splitInlineFieldDefs(fieldMatch.group(1))
+
 
     def tokenize(self, strSrc: str) -> None:
         '''
@@ -2372,8 +2419,19 @@ class ABCHandler:
                 self.skipAhead = j - (self.pos + 1)
                 continue
 
-            # get chords
+            # get chords and inline information fields
             if c == '[':
+                # An inline field, e.g. [K:F] or [M:3/4 L:1/8], takes effect
+                # at this point in the music rather than being sounded as a
+                # chord; only an unmatched expression is really a chord.
+                inlineMatch = reInlineMetadataFields.match(self.strSrc, self.pos)
+                if inlineMatch is not None:
+                    innerSrc = inlineMatch.group(1)
+                    for fieldDef in self._splitInlineFieldDefs(innerSrc):
+                        self.tokens.append(ABCMetadata(fieldDef))
+                    self.skipAhead = inlineMatch.end() - (self.pos + 1)
+                    continue
+
                 j = self.pos + 1
 
                 # find closing chord bracket
@@ -3192,15 +3250,14 @@ class ABCHandler:
                 xClip = x + 1
                 # ah.tokens = ah.tokens[1:]  # remove first, as not done above
 
-            # if x boundary is metadata, do not include it (as it is likely in the previous
-            # measure) unless it is at the beginning.
+            # metadata at a boundary is kept so that standalone information
+            # fields between two bars (e.g. a K:, M:, L: or Q: line) stay with
+            # the following measure and take effect there. The one exception is
+            # the first boundary: the final header token is already part of the
+            # leading metadata handler, so it would otherwise appear twice.
             elif x != 0 and isinstance(self.tokens[x], ABCMetadata):
-                xClip = x + 1
-            else:
-                # if we find a note in the x-clip position, it is likely a pickup the
-                # first note after metadata. this we keep, b/c it
-                # should be part of this branch
-                pass
+                if barIndices and x == barIndices[0] and x != 0:
+                    xClip = x + 1
 
             if y >= len(self):
                 yTestIndex = len(self)
@@ -3253,11 +3310,14 @@ class ABCHandler:
         '''
         barIndices = []
         tNext = None
+        tPrev = None
         for i, token in enumerate(self.tokens):
             try:
                 tNext = self.tokens[i + 1]
             except IndexError:
                 tNext = None
+            if i > 0:
+                tPrev = self.tokens[i - 1]
 
             # either we get a bar, or we just complete metadata and
             # possibly encounter a note (a pickup)
@@ -3266,10 +3326,13 @@ class ABCHandler:
                 barIndices.append(i)  # store position
                 # barCount += 1  # not used
             # case of end of metadata and start of notes in a pickup
-            # tag the last metadata as the end
+            # tag the last metadata as the end. An inline information field
+            # (one reached after notes, e.g. AB[K:F]cd) is not a boundary: it
+            # belongs to the music around it, not to a new measure.
             elif (isinstance(token, ABCMetadata)
                   and tNext is not None
-                  and isinstance(tNext, (ABCNote, ABCChord))):
+                  and isinstance(tNext, (ABCNote, ABCChord))
+                  and not isinstance(tPrev, (ABCNote, ABCChord))):
                 barIndices.append(i)  # store position
 
         return barIndices
@@ -4049,6 +4112,50 @@ class Test(unittest.TestCase):
         ah = ABCHandler()
         ah.process(testFiles.graceTest)
         self.assertEqual(len(ah), 85)
+
+    def testInlineInformationFieldTokenization(self):
+        # inline fields are metadata, not empty chords; a real chord survives
+        ah = ABCHandler()
+        ah.tokenize('AB[K:F]cd [L:1/8]ef [ce]g')
+        metadataSrc = [t.src for t in ah.tokens if isinstance(t, ABCMetadata)]
+        self.assertIn('K:F', metadataSrc)
+        self.assertIn('L:1/8', metadataSrc)
+        self.assertNotIn('[K:F]', [t.src for t in ah.tokens if isinstance(t, ABCChord)])
+        # the genuine chord keeps its bracket form
+        chordTokens = [t for t in ah.tokens if isinstance(t, ABCChord)]
+        self.assertEqual([t.src for t in chordTokens], ['[ce]'])
+
+    def testMultipleInlineFieldsInOneBracket(self):
+        ah = ABCHandler()
+        ah.tokenize('[M:3/4 L:1/8]AB')
+        metadata = [t for t in ah.tokens if isinstance(t, ABCMetadata)]
+        for token in metadata:
+            token.preParse()
+        self.assertEqual([(t.tag, t.data) for t in metadata],
+                         [('M', '3/4'), ('L', '1/8')])
+
+    def testStandaloneFieldSurvivesMeasureSplit(self):
+        # a K:/M:/Q: line between two bars stays with the following measure
+        ah = ABCHandler()
+        ah.process('X:1\nM:4/4\nL:1/4\nK:G\nABCD|\nK:D\nABCD|\n')
+        merged = mergeLeadingMetaData(ah.splitByMeasure())
+        secondMeasure = merged[1]
+        self.assertTrue(
+            any(isinstance(t, ABCMetadata) and t.tag == 'K'
+                for t in secondMeasure.tokens)
+        )
+
+    def testInlineFieldDoesNotSplitMeasureAtBarline(self):
+        # AB[K:F]cd | is one measure; the inline field is not a bar boundary
+        ah = ABCHandler()
+        ah.process('X:1\nM:4/4\nL:1/4\nK:G\nAB[K:F]cd|ABcd|')
+        handlers = ah.splitByMeasure()
+        musicHandlers = [h for h in handlers if h.hasNotes()]
+        self.assertEqual(len(musicHandlers), 2)
+        self.assertIn(
+            'K:F',
+            [t.src for t in musicHandlers[0].tokens]
+        )
 
     def testGuineaPig(self):
         from music21.abcFormat import testFiles

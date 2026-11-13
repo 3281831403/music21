@@ -20,6 +20,7 @@ module's :func:`~music21.converter.parse` function.
 from __future__ import annotations
 
 import copy
+import os
 import unittest
 import re
 import typing  # cannot import as t because of use of t as token throughout
@@ -29,9 +30,11 @@ from music21 import bar
 from music21 import clef
 from music21 import chord
 from music21 import common
+from music21.common.types import OffsetQL
 from music21 import environment
 from music21 import exceptions21
 from music21 import harmony
+from music21 import key
 from music21 import meter
 from music21 import note
 from music21 import spanner
@@ -110,6 +113,7 @@ def abcToStreamPart(
     barCount = 0
     measureNumber = 1
     lyricTargets: list[note.GeneralNote] = []
+    explicitMeterMeasures: set[stream.Measure] = set()
     # merged handler are ABCHandlerBar objects, defining attributes for barlines
 
     for mh in mergedHandlers:
@@ -182,34 +186,41 @@ def abcToStreamPart(
         # environLocal.printDebug([mh, 'dst', dst])
         # ql = 0  # might not be zero if there is a pickup
 
-        postTransposition, clefSet = parseTokens(
+        (postTransposition,
+         clefSet,
+         extraMeasures,
+         handlerMeterMeasures) = parseTokens(
             mh, dst, p, useMeasures, lyricTargets
         )
+        explicitMeterMeasures.update(handlerMeterMeasures)
+
+        # measures produced by inline key/meter fields follow the current one
+        allOutputMeasures: list[stream.Measure] = []
+        if useMeasures and isinstance(dst, stream.Measure):
+            allOutputMeasures.append(dst)
+        allOutputMeasures.extend(extraMeasures)
 
         # append measure to part; in the case of trailing metadata
         # dst may be part, even though useMeasures is True
-        if useMeasures and isinstance(dst, stream.Measure):
-            # check for incomplete bars
-            # must have a time signature in this bar, or defined recently
-            # could use getTimeSignatures() on Stream
-
-            if barCount == 1 and dst.timeSignature is not None:  # easy case
+        for measureIndex, outputMeasure in enumerate(allOutputMeasures):
+            if barCount == 1 and measureIndex == 0 and outputMeasure.timeSignature is not None:
                 # can only do this b/c ts is defined
-                if dst.barDurationProportion() < 1.0:
-                    dst.padAsAnacrusis()
-                    dst.number = 0
+                if outputMeasure.barDurationProportion() < 1.0:
+                    outputMeasure.padAsAnacrusis()
+                    outputMeasure.number = 0
                     # environLocal.printDebug([
                     #    'incompletely filled Measure found on abc import; ',
-                    #    'interpreting as a anacrusis:', 'paddingLeft:', dst.paddingLeft])
+                    #    'interpreting as a anacrusis:', 'paddingLeft:',
+                    #    outputMeasure.paddingLeft])
             else:
-                dst.number = measureNumber
+                outputMeasure.number = measureNumber
                 measureNumber += 1
-            p.coreAppend(dst)
+            p.coreAppend(outputMeasure)
 
     p.coreElementsChanged()
 
     try:
-        reBar(p, inPlace=True)
+        reBar(p, inPlace=True, explicitMeterMeasures=explicitMeterMeasures)
     except (ABCTranslateException, meter.MeterException, ZeroDivisionError):
         pass
     # clefs are not typically defined, but if so, are set to the first measure
@@ -258,25 +269,87 @@ def parseTokens(
     p: stream.Part,
     useMeasures: bool,
     lyricTargets: list[note.GeneralNote],
-) -> tuple[int, bool]:
+) -> tuple[int, bool, list[stream.Measure], set[stream.Measure]]:
     '''
     Parses all the tokens in a measure or part.
+
+    An inline key or meter field (one encountered after music has begun)
+    starts a new measure at the offset where it appears. The additional
+    measures created this way are returned in order so the caller can insert
+    them into the part. The final set holds measures whose meter comes from an
+    explicit M: field, which reBar leaves unsplit.
     '''
     # in case need to transpose due to clef indication
     from music21 import abcFormat
 
     postTransposition = 0
     clefSet = False
-    for t in mh.tokens:
+    extraMeasures: list[stream.Measure] = []
+    # Measures whose time signature comes from an explicit M: field rather
+    # than from rebarring overflow; reBar must leave these intact.
+    explicitMeterMeasures: set[stream.Measure] = set()
+    # Offset reached by the notes parsed so far. Information fields appearing
+    # before any note govern the start of the measure; fields encountered later
+    # are inline and must take effect at this offset.
+    currentOffset: OffsetQL = 0.0
+    tokenList = mh.tokens
+    # Pairs of (source measure, new measure, declaresNewMeter) awaiting fitting;
+    # fitting is deferred until all notes have been placed so each measure's
+    # final contents are known.
+    fitRequests: list[tuple[stream.Measure, stream.Measure, bool]] = []
+    for tokenIndex, t in enumerate(tokenList):
         if isinstance(t, abcFormat.ABCMetadata):
             if t.tag == 'w':
                 addABCLyrics(t.data, lyricTargets)
                 lyricTargets.clear()
-            postTransposition, clefSet = metadataToM21Object(
-                t, dst, postTransposition, clefSet, useMeasures
+            isLeadingField = currentOffset == 0.0
+            # A field that ends a measure (nothing follows but the barline)
+            # really belongs to the next measure, where it arrives as a
+            # leading field; skip it here to avoid a duplicate or a stray
+            # zero-duration object at the end of the current measure.
+            hasFollowingNotes = any(
+                isinstance(tokenList[k], abcFormat.ABCNote)
+                for k in range(tokenIndex + 1, len(tokenList))
             )
+            isBarlineTerminalField = not hasFollowingNotes
+            if isBarlineTerminalField and not isLeadingField:
+                continue
+            # A key or meter field with notes still to come opens a new
+            # measure; other fields (L:, Q:, ...) take effect inline at their
+            # offset without starting a measure.
+            if (not isLeadingField
+                    and useMeasures
+                    and isinstance(dst, stream.Measure)
+                    and (t.isKey() or t.isMeter())
+                    and hasFollowingNotes):
+                # Split the measure at the current offset: the field becomes
+                # the opening element of a fresh measure, keeping its position.
+                sourceMeasure = dst
+                newMeasure = stream.Measure()
+                splitOffset = currentOffset
+                _moveElementsFromOffset(sourceMeasure, newMeasure, splitOffset)
+                extraMeasures.append(newMeasure)
+                dst = newMeasure
+                currentOffset = common.opFrac(currentOffset - splitOffset)
+                postTransposition, clefSet = metadataToM21Object(
+                    t, dst, postTransposition, clefSet, useMeasures,
+                    atOffset=0.0,
+                )
+                if t.isMeter():
+                    explicitMeterMeasures.add(newMeasure)
+                fitRequests.append((sourceMeasure, newMeasure, t.isMeter()))
+            else:
+                postTransposition, clefSet = metadataToM21Object(
+                    t, dst, postTransposition, clefSet, useMeasures,
+                    atOffset=None if isLeadingField else currentOffset,
+                )
+                if (t.isMeter()
+                        and isLeadingField
+                        and isinstance(dst, stream.Measure)):
+                    explicitMeterMeasures.add(dst)
         elif isinstance(t, abcFormat.ABCNote):
-            m21Note = parseABCNote(t, dst)
+            m21Note = parseABCNote(t, dst, atOffset=currentOffset)
+            currentOffset = common.opFrac(currentOffset + t.quarterLength)
             if m21Note is not None and not isinstance(m21Note, note.Rest) and not t.inGrace:
                 lyricTargets.append(m21Note)
         elif isinstance(t, abcFormat.ABCSlurStart):
@@ -292,7 +365,73 @@ def parseTokens(
                 assert t.dimObj is not None
             p.coreAppend(t.dimObj)
     dst.coreElementsChanged()
-    return postTransposition, clefSet
+    for fitSource, fitDestination, fitDeclaresMeter in fitRequests:
+        _fitMeasureToContents(fitSource, fitDestination,
+                              declaresNewMeter=fitDeclaresMeter)
+    return postTransposition, clefSet, extraMeasures, explicitMeterMeasures
+
+
+def _moveElementsFromOffset(
+    source: stream.Measure,
+    destination: stream.Measure,
+    splitOffset: OffsetQL,
+) -> None:
+    '''
+    Move every element beginning at or after `splitOffset` from `source` into
+    `destination`, re-based so the first moved element sits at offset 0.
+
+    Opening-only attributes (time signature, key signature, clef) stay with the
+    source measure; they are re-declared on the destination as needed by the
+    inline field that triggered the split.
+    '''
+    toMove = [el for el in source
+              if source.elementOffset(el) >= splitOffset]
+    for el in toMove:
+        oldOffset = source.elementOffset(el)
+        source.remove(el)
+        destination.coreInsert(
+            common.opFrac(oldOffset - splitOffset), el, ignoreSort=True
+        )
+    source.coreElementsChanged()
+    destination.coreElementsChanged()
+
+
+def _fitMeasureToContents(
+    source: stream.Measure,
+    destination: stream.Measure,
+    *,
+    declaresNewMeter: bool,
+) -> None:
+    '''
+    Fit the time signatures of the two measures created by splitting at an
+    inline information field to the notes each one contains.
+
+    Splitting one notated measure produces two shorter measures. Giving each a
+    time signature whose bar duration equals its contents means neither is an
+    underfull measure, so MusicXML export adds no padding rests and the field's
+    position is preserved on roundtrip. An explicit meter change still wins on
+    the destination measure.
+    '''
+    from music21 import meter as meterModule
+
+    def fit(measure: stream.Measure) -> None:
+        if measure.highestTime == 0:
+            return
+        try:
+            measure.timeSignature = measure.bestTimeSignature()
+        except meterModule.MeterException:
+            pass
+
+    if declaresNewMeter:
+        # the destination declares its own meter; only the source needs fitting
+        fit(source)
+    else:
+        # carry the meter into the new measure before re-fitting it
+        if source.timeSignature is not None and destination.timeSignature is None:
+            destination.timeSignature = copy.deepcopy(source.timeSignature)
+        fit(source)
+        fit(destination)
+
 
 
 def addABCLyrics(lyricData: str, lyricTargets: list[note.GeneralNote]) -> None:
@@ -323,9 +462,13 @@ def addABCLyrics(lyricData: str, lyricTargets: list[note.GeneralNote]) -> None:
 def parseABCNote(
     t: abcFormat.ABCNote,
     dst: stream.Measure|stream.Part,
+    atOffset: OffsetQL|None = None,
 ) -> note.GeneralNote|None:
     '''
     Parse an ABCNote object and add it to the destination stream.
+
+    When `atOffset` is given, the note (or chord) is inserted at that offset;
+    otherwise it is appended at the stream's current highest time.
     '''
     from music21 import abcFormat
 
@@ -345,7 +488,10 @@ def parseABCNote(
                 return None  # fingering diagram?  Appears in some pieces, ryans-Neumedia
             else:
                 cs = harmony.ChordSymbol(cs_name)
-            dst.coreAppend(cs, setActiveSite=False)
+            if atOffset is None:
+                dst.coreAppend(cs, setActiveSite=False)
+            else:
+                dst.coreInsert(atOffset, cs, ignoreSort=True, setActiveSite=False)
             dst.coreElementsChanged()
         except ValueError:
             pass  # Exclude malformed chord
@@ -379,7 +525,10 @@ def parseABCNote(
             acc = c.pitches[pIndex].accidental
             if acc is not None:
                 acc.displayStatus = accStatusList[pIndex]
-        dst.coreAppend(c)
+        if atOffset is None:
+            dst.coreAppend(c)
+        else:
+            dst.coreInsert(atOffset, c, ignoreSort=True)
         return c
 
         # ql += t.quarterLength
@@ -423,8 +572,28 @@ def parseABCNote(
             m21ArticulationObj = m21ArticulationClass()
             n.articulations.append(m21ArticulationObj)
 
-        dst.coreAppend(n, setActiveSite=False)
+        if atOffset is None:
+            dst.coreAppend(n, setActiveSite=False)
+        else:
+            dst.coreInsert(atOffset, n, ignoreSort=True, setActiveSite=False)
         return n
+
+
+def _placeMetadataObject(
+    dst: stream.Measure|stream.Part,
+    m21Object,
+    atOffset: OffsetQL|None,
+) -> None:
+    '''
+    Place a key signature, time signature, clef or tempo object produced by
+    an ABC information field. A None offset means the field leads the measure
+    and may be assigned as the measure's opening element; an explicit offset
+    means the field appeared inline and must take effect at that position.
+    '''
+    if atOffset is None:
+        dst.coreAppend(m21Object)
+    else:
+        dst.coreInsert(atOffset, m21Object, ignoreSort=True)
 
 
 def metadataToM21Object(
@@ -433,14 +602,20 @@ def metadataToM21Object(
     postTransposition: int,
     clefSet: bool,
     useMeasures: bool,
+    atOffset: OffsetQL|None = None,
 ) -> tuple[int, bool]:
     '''
     Parse a single ABCMetadata token, that does not represent what
     music21 considers metadata, such as a time signature, key signature,
     clef, or tempo, and put it in dst.
 
-    This function uses coreAppend operations, so if called separately,
-    dst.coreElementsChanged() should be called before accessing the stream.
+    When `atOffset` is None the field is treated as leading the measure;
+    otherwise it appeared inline and the resulting object is inserted at that
+    offset.
+
+    This function uses coreAppend/coreInsert operations, so if called
+    separately, dst.coreElementsChanged() should be called before accessing
+    the stream.
 
     Returns the changed transposition and whether clef was set.
     '''
@@ -448,17 +623,17 @@ def metadataToM21Object(
         ts = t.getTimeSignatureObject()
         if ts is not None:  # can be None
             # should append at the right position
-            if useMeasures:  # assume at start of measures
+            if useMeasures and atOffset is None:  # assume at start of measures
                 dst.timeSignature = ts
             else:
-                dst.coreAppend(ts)
+                _placeMetadataObject(dst, ts, atOffset)
     elif t.isKey():
         ks = t.getKeySignatureObject()
-        if ks is not None and useMeasures:
+        if ks is not None and useMeasures and atOffset is None:
             # assume at start of measures
             dst.keySignature = ks
         elif ks is not None:
-            dst.coreAppend(ks)
+            _placeMetadataObject(dst, ks, atOffset)
         # check for clef information sometimes stored in key
         clefObj, transposition = t.getClefObject()
         if clefObj is not None and transposition is not None:
@@ -466,16 +641,16 @@ def metadataToM21Object(
             clefSet = False
             # environLocal.printDebug(['found clef in key token:', t,
             #     clefObj, transposition])
-            if useMeasures:  # assume at start of measures
+            if useMeasures and atOffset is None:  # assume at start of measures
                 dst.clef = clefObj
             else:
-                dst.coreAppend(clefObj)
+                _placeMetadataObject(dst, clefObj, atOffset)
             postTransposition = transposition
     elif t.isTempo():
         mmObj = t.getMetronomeMarkObject()
         if typing.TYPE_CHECKING:
             assert mmObj is not None
-        dst.coreAppend(mmObj)
+        _placeMetadataObject(dst, mmObj, atOffset)
 
     return postTransposition, clefSet
 
@@ -615,16 +790,31 @@ def abcToStreamOpus(
 
 
 @typing.overload
-def reBar(music21Part: stream.Part, *, inPlace: typing.Literal[True]) -> None:
+def reBar(
+    music21Part: stream.Part,
+    *,
+    inPlace: typing.Literal[True],
+    explicitMeterMeasures: set[stream.Measure]|None = None,
+) -> None:
     ...
 
 
 @typing.overload
-def reBar(music21Part: stream.Part, *, inPlace: typing.Literal[False] = False) -> stream.Part:
+def reBar(
+    music21Part: stream.Part,
+    *,
+    inPlace: typing.Literal[False] = False,
+    explicitMeterMeasures: set[stream.Measure]|None = None,
+) -> stream.Part:
     ...
 
 
-def reBar(music21Part: stream.Part, *, inPlace: bool = False) -> stream.Part|None:
+def reBar(
+    music21Part: stream.Part,
+    *,
+    inPlace: bool = False,
+    explicitMeterMeasures: set[stream.Measure]|None = None,
+) -> stream.Part|None:
     # noinspection PyShadowingNames,SpellCheckingInspection
     '''
     Re-bar overflow measures using the last known time signature.
@@ -678,27 +868,45 @@ def reBar(music21Part: stream.Part, *, inPlace: bool = False) -> stream.Part|Non
     {0.0} <music21.note.Note E>
 
     * Changed in v5: inPlace is False by default, and a keyword only argument.
+    * Changed in v11: ``explicitMeterMeasures`` names measures that carry an
+      encoded meter change and are therefore left unsplit.
     '''
     if not inPlace:
         music21Part = copy.deepcopy(music21Part)
+    if explicitMeterMeasures is None:
+        explicitMeterMeasures = set()
     lastTimeSignature = None
     measureNumberOffset = 0  # amount to shift current measure numbers
     allMeasures = music21Part.getElementsByClass(stream.Measure)
     for measureIndex in range(len(allMeasures)):
         music21Measure = allMeasures[measureIndex]
+        # The time signature active at the start of this measure governs its
+        # bar length; a meter change found inside the measure takes effect only
+        # from the following (ABC-encoded) measure.
+        startOfMeasureTimeSignature = lastTimeSignature
         if music21Measure.timeSignature is not None:
             lastTimeSignature = music21Measure.timeSignature
 
-        if lastTimeSignature is None:
-            raise ABCTranslateException('No time signature found in this Part')
+        if startOfMeasureTimeSignature is None:
+            if lastTimeSignature is None:
+                raise ABCTranslateException('No time signature found in this Part')
+            startOfMeasureTimeSignature = lastTimeSignature
 
-        tsEnd = lastTimeSignature.barDuration.quarterLength
+        tsEnd = startOfMeasureTimeSignature.barDuration.quarterLength
         mEnd = common.opFrac(music21Measure.highestTime)
         music21Measure.number += measureNumberOffset
-        if mEnd > tsEnd:
+        # A measure carrying an explicit meter change keeps its encoded
+        # contents intact; other overfull measures are missing-barlines errors
+        # that reBar splits to fit the meter. The first measure may carry the
+        # header meter while still overflowing from a missing barline, so it is
+        # never protected.
+        isExplicitMeterChange = (
+            measureIndex > 0 and music21Measure in explicitMeterMeasures
+        )
+        if mEnd > tsEnd and not isExplicitMeterChange:
             m1, m2 = music21Measure.splitAtQuarterLength(tsEnd)
             m2.timeSignature = None
-            if lastTimeSignature.barDuration.quarterLength != m2.highestTime:
+            if startOfMeasureTimeSignature.barDuration.quarterLength != m2.highestTime:
                 try:
                     m2.timeSignature = m2.bestTimeSignature()
                 except meter.MeterException:
@@ -1250,6 +1458,135 @@ w:first second third
         from music21 import corpus
         unused = corpus.parse('josquin/laDeplorationDeLaMorteDeJohannesOckeghem')
         # this was getting incorrect Clefs
+
+    def testStandaloneKeyFieldChangesSignatureAndPitches(self):
+        from music21 import converter
+        from music21 import key
+        s = converter.parse(
+            'X:1\nM:4/4\nL:1/4\nK:G\nABCD|\nK:D\nABCD|\n', format='abc'
+        )
+        measures = list(s.parts.first().getElementsByClass(stream.Measure))
+        self.assertEqual(measures[0].keySignature.sharps, 1)  # G major
+        self.assertEqual(measures[1].keySignature.sharps, 2)  # D major
+        # pitches after the change follow D major
+        self.assertEqual(
+            [n.name for n in measures[1].notes], ['A', 'B', 'C#', 'D']
+        )
+        self.assertIsInstance(measures[1].keySignature, key.KeySignature)
+
+    def testStandaloneMeterFieldChangesMeasureLength(self):
+        from music21 import converter
+        s = converter.parse(
+            'X:1\nM:4/4\nL:1/4\nK:C\nABC|\nM:3/4\nABC|\n', format='abc'
+        )
+        measures = list(s.parts.first().getElementsByClass(stream.Measure))
+        self.assertEqual(measures[0].timeSignature.ratioString, '4/4')
+        self.assertEqual(measures[1].timeSignature.ratioString, '3/4')
+        self.assertEqual(measures[1].barDuration.quarterLength, 3.0)
+
+    def testStandaloneTempoFieldMakesMetronomeMark(self):
+        from music21 import converter
+        s = converter.parse(
+            'X:1\nM:4/4\nL:1/4\nK:C\nABCD|\nQ:1/4=60\nABCD|\n', format='abc'
+        )
+        marks = list(s.flatten().getElementsByClass(tempo.MetronomeMark))
+        self.assertEqual(len(marks), 1)
+        self.assertEqual(marks[0].number, 60)
+
+    def testDefaultLengthFieldChangesFollowingNoteLengths(self):
+        from music21 import converter
+        s = converter.parse(
+            'X:1\nM:4/4\nL:1/4\nK:C\nAB|\nL:1/8\nABcd|\n', format='abc'
+        )
+        measures = list(s.parts.first().getElementsByClass(stream.Measure))
+        self.assertEqual([n.quarterLength for n in measures[0].notes], [1.0, 1.0])
+        self.assertEqual(
+            [n.quarterLength for n in measures[1].notes], [0.5, 0.5, 0.5, 0.5]
+        )
+
+    def testInlineAndStandaloneFieldsGiveSameResult(self):
+        from music21 import converter
+        # the field leads the second measure in both encodings, so the pitches
+        # and key signatures it produces must match
+        standalone = converter.parse(
+            'X:1\nM:4/4\nL:1/4\nK:G\nABCD|\nK:F\nABcd|\n', format='abc'
+        )
+        inline = converter.parse(
+            'X:1\nM:4/4\nL:1/4\nK:G\nABCD|[K:F]ABcd|\n', format='abc'
+        )
+        standNotes = [(n.name, n.quarterLength)
+                      for n in standalone.flatten().notes]
+        inlineNotes = [(n.name, n.quarterLength)
+                       for n in inline.flatten().notes]
+        self.assertEqual(standNotes, inlineNotes)
+        standKeys = [k.sharps for k in standalone.flatten().getElementsByClass(
+            key.KeySignature)]
+        inlineKeys = [k.sharps for k in inline.flatten().getElementsByClass(
+            key.KeySignature)]
+        self.assertEqual(standKeys, inlineKeys)
+
+    def testInlineChordNotConfusedWithField(self):
+        from music21 import converter
+        from music21 import chord as chordModule
+        s = converter.parse(
+            'X:1\nM:4/4\nL:1/4\nK:G\n[K:F]AB|[ce]FG|\n', format='abc'
+        )
+        # the field changes the key; the bracket chord remains a chord
+        keySignatures = list(s.flatten().getElementsByClass(key.KeySignature))
+        self.assertEqual(keySignatures[-1].sharps, -1)
+        chords = list(s.flatten().getElementsByClass(chordModule.Chord))
+        self.assertEqual(len(chords), 1)
+        self.assertEqual([p.name for p in chords[0].pitches], ['C', 'E'])
+
+    def testInformationFieldsSurviveMusicXmlRoundtrip(self):
+        import tempfile
+        from music21 import converter
+
+        abc = (
+            'X:1\nT:Roundtrip\nM:4/4\nL:1/4\nK:G\n'
+            'AB[K:F]cd|AB[M:2/4 L:1/8]cdef|\n'
+        )
+        score = converter.parse(abc, format='abc')
+        with tempfile.NamedTemporaryFile(suffix='.musicxml', delete=False) as handle:
+            filePath = handle.name
+        try:
+            score.write('musicxml', fp=filePath)
+            reloaded = converter.parse(filePath)
+        finally:
+            os.remove(filePath)
+
+        originalKeyOffsets = [
+            (k.sharps, round(float(k.getContextByClass(stream.Measure)
+                                   .elementOffset(k)), 3))
+            if k.getContextByClass(stream.Measure) is not None else (k.sharps, 0.0)
+            for k in score.flatten().getElementsByClass(key.KeySignature)
+        ]
+        reloadedKeyOffsets = [
+            (k.sharps, round(float(k.getContextByClass(stream.Measure)
+                                   .elementOffset(k)), 3))
+            if k.getContextByClass(stream.Measure) is not None else (k.sharps, 0.0)
+            for k in reloaded.flatten().getElementsByClass(key.KeySignature)
+        ]
+        self.assertEqual(originalKeyOffsets, reloadedKeyOffsets)
+
+        originalMeters = {
+            m.ratioString for m in score.flatten().getElementsByClass(
+                meter.TimeSignature)
+        }
+        reloadedMeters = {
+            m.ratioString for m in reloaded.flatten().getElementsByClass(
+                meter.TimeSignature)
+        }
+        self.assertEqual(originalMeters, reloadedMeters)
+
+        originalDurations = [n.quarterLength for n in score.flatten().notes]
+        reloadedDurations = [n.quarterLength for n in reloaded.flatten().notes]
+        self.assertEqual(originalDurations, reloadedDurations)
+        # no padding rests were introduced on export
+        self.assertEqual(
+            len(score.flatten().getElementsByClass(note.Rest)),
+            len(reloaded.flatten().getElementsByClass(note.Rest)),
+        )
 
 
 if __name__ == '__main__':
