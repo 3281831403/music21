@@ -246,6 +246,50 @@ class Test(unittest.TestCase):
             mxNote = MEX.unpitchedToXml(up)
         self.assertEqual(mxNote.findtext('unpitched/display-octave'), '0')
 
+    def testMicrotonePitchExport(self):
+        # AI-assisted (Claude)
+        # A microtone-only pitch must still get an <alter> carrying the full
+        # fractional value, instead of being silently rounded to a natural.
+        MEX = MeasureExporter()
+        cases = {
+            50: '0.5',
+            25: '0.25',
+            -25: '-0.25',
+            75: '0.75',
+            -75: '-0.75',
+        }
+        for cents, expectedAlter in cases.items():
+            with self.subTest(cents=cents):
+                p = pitch.Pitch('C4')
+                p.microtone = cents
+                mxPitch = MEX.pitchToXml(p)
+                self.assertEqual(mxPitch.findtext('alter'), expectedAlter)
+                self.assertEqual(mxPitch.findtext('step'), 'C')
+                self.assertEqual(mxPitch.findtext('octave'), '4')
+
+        # an accidental plus a microtone combine into one alter
+        p = pitch.Pitch('C#4')
+        p.microtone = -25
+        mxPitch = MEX.pitchToXml(p)
+        self.assertEqual(mxPitch.findtext('alter'), '0.75')
+
+        # a plain twelve-tone natural keeps no alter tag, as before
+        mxPitch = MEX.pitchToXml(pitch.Pitch('C4'))
+        self.assertIsNone(mxPitch.find('alter'))
+
+    def testMicrotoneXmlRoundTrip(self):
+        # AI-assisted (Claude)
+        from music21.musicxml.xmlToM21 import MeasureParser
+        MP = MeasureParser()
+        MEX = MeasureExporter()
+        for cents in (50, 25, -25, 75, -75, 33.3333):
+            with self.subTest(cents=cents):
+                p = pitch.Pitch('C4')
+                p.microtone = cents
+                mxPitch = MEX.pitchToXml(p)
+                pReturned = MP.xmlToPitch(mxPitch)
+                self.assertLess(abs(pReturned.ps - p.ps) * 100, 1.0)
+
     def testUnpitchedGraceInVoice(self):
         '''
         <unpitched> must precede <voice> even on a grace note, which has

@@ -295,7 +295,9 @@ File formats
 * **LilyPond**: output targets current LilyPond (``\tuplet``, modern barline
   names, ``\markuplist``), and every ``stringOutput()`` returns a ``str``.
 * **MIDI**: ``midiEventsToInstrument`` is removed; use
-  ``midiEventToInstrument``.
+  ``midiEventToInstrument``.  ``TimedNoteEvent`` gained a fourth field,
+  ``bendCents``, so unpack with ``tOn, tOff, midiOnEvent, bendCents = ...``
+  (or attribute access) instead of three names.
 * **Scala**: ``Scale.write('scala', fp=...)`` returns a ``pathlib.Path``.
 * **Vexflow**: the ``music21.vexflow`` module and the ``'vexflow'`` format for
   ``show()`` and ``write()`` are gone.  It had not worked in a decade; music21j

@@ -1883,6 +1883,47 @@ class Test(unittest.TestCase):
                              '<duration>5</duration><type>eighth</type></note>')
             self.assertEqual(MP.xmlToRest(mxRest).stepShift, 0)
 
+    def testFractionalAlterImport(self):
+        # AI-assisted (Claude)
+        # Any numeric alter is legal MusicXML; fractional values used to raise
+        # MusicXMLImportException and now split into Accidental plus Microtone.
+        MP = MeasureParser()
+        cases = {
+            '0.25': (60.25, 0.0, 25.0),
+            '-0.25': (59.75, 0.0, -25.0),
+            '1.25': (61.25, 1.0, 25.0),
+            '-0.75': (59.25, -0.5, -25.0),
+            '0.5': (60.5, 0.5, None),
+            '2': (62.0, 2.0, None),
+        }
+        for alterText, (expectedPs, expectedAccAlter, expectedMicroCents) in cases.items():
+            with self.subTest(alter=alterText):
+                mxNote = self.EL(
+                    '<note><pitch><step>C</step>'
+                    f'<alter>{alterText}</alter>'
+                    '<octave>4</octave></pitch></note>')
+                p = MP.xmlToPitch(mxNote)
+                self.assertEqual(p.ps, expectedPs)
+                self.assertEqual(p.accidental.alter, expectedAccAlter)
+                if expectedMicroCents is None:
+                    self.assertIsNone(p._microtone)
+                else:
+                    self.assertEqual(p.microtone.cents, expectedMicroCents)
+
+    def testFractionalAlterWithNamedAccidentalImport(self):
+        # AI-assisted (Claude)
+        # A named <accidental> keeps its symbol while a differing <alter>
+        # stores the full numeric value without raising.
+        MP = MeasureParser()
+        mxNote = self.EL(
+            '<note><pitch><step>C</step><alter>0.75</alter>'
+            '<octave>4</octave></pitch>'
+            '<accidental>quarter-sharp</accidental></note>')
+        p = MP.xmlToPitch(mxNote)
+        self.assertEqual(p.accidental.name, 'half-sharp')
+        self.assertEqual(p.accidental.alter, 0.75)
+        self.assertEqual(p.ps, 60.75)
+
 
 if __name__ == '__main__':
     import music21

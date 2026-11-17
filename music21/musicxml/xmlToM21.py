@@ -3244,6 +3244,10 @@ class MeasureParser(XMLParserBase):
 
         >>> a.accidental.modifier
         '#'
+
+        * Changed in v11: fractional ``<alter>`` values such as 0.25 no longer
+          raise MusicXMLImportException; they are split into an Accidental and
+          a Microtone.
         '''
         seta = _setAttributeFromTagText
         if inputM21 is None:
@@ -3285,12 +3289,11 @@ class MeasureParser(XMLParserBase):
                 # MuseScore 0.9.6 generates Accidentals with empty objects
                 pass
         elif accAlter is not None:
-            try:
-                p.accidental = pitch.Accidental(accAlter)
-            except pitch.AccidentalException:
-                raise MusicXMLImportException(
-                    f'incorrect accidental {accAlter} for pitch {p}')
-            # TODO: check supports for accidentals!
+            # Any numeric alter is legal in MusicXML, including fractional
+            # values such as 0.25.  Assigning the float to .accidental splits
+            # it into the nearest supported Accidental plus a Microtone
+            # instead of rejecting the file with an exception.
+            p.accidental = float(accAlter)
             p.accidental.displayStatus = False
 
         return p

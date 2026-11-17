@@ -27,6 +27,8 @@ from music21.midi.translate import (
     TranslateWarning,
     channelInstrumentData,
     conductorStream,
+    getBendAtTick,
+    getBendRangesFromEvents,
     getMetaEvents,
     midiAsciiStringToBinaryString,
     midiEventToInstrument,
@@ -1736,6 +1738,113 @@ class Test(unittest.TestCase):
                 + b'\x00\xff\x2f\x00')
         with self.assertRaisesRegex(stream.StreamException, 'more than 100000 measures'):
             converter.parse(data, format='midi')
+
+    def testPitchBendCentsRoundTrip(self):
+        # AI-assisted (Claude)
+        # getPitchBend is the inverse of setPitchBend across the full range.
+        mt = MidiTrack(1)
+        for bendRange in (2, 4, 12):
+            for cents in (-196, -150, -50, -1, 0, 1, 25, 50, 100, 196):
+                me = MidiEvent(mt, type=ChannelVoiceMessages.PITCH_BEND)
+                me.setPitchBend(cents, bendRange=bendRange)
+                self.assertLess(
+                    abs(me.getPitchBend(bendRange=bendRange) - cents), 1.0)
+
+    def testGetBendRangesFromRpn(self):
+        # AI-assisted (Claude)
+        def controller(channel, controllerNumber, value):
+            ev = MidiEvent(type=ChannelVoiceMessages.CONTROLLER_CHANGE)
+            ev.channel = channel
+            ev.parameter1 = controllerNumber
+            ev.parameter2 = value
+            return ev
+
+        timedEvents = [
+            (0, controller(1, 101, 0)),
+            (0, controller(1, 100, 0)),
+            (0, controller(1, 6, 4)),
+            (0, controller(1, 38, 0)),
+            (10, controller(2, 101, 0)),
+            (10, controller(2, 100, 0)),
+            (10, controller(2, 6, 12)),
+            (10, controller(2, 38, 50)),
+        ]
+        self.assertEqual(getBendRangesFromEvents(timedEvents),
+                         {1: 4.0, 2: 12.5})
+        # no RPN at all -> nothing declared, callers use the default range
+        self.assertEqual(getBendRangesFromEvents([]), {})
+
+    def testGetBendAtTickSameTickReset(self):
+        # AI-assisted (Claude)
+        # A wheel reset and the note's own bend can share an onset tick;
+        # the last same-tick bend belongs to the note.
+        def bend(channel, cents):
+            ev = MidiEvent(type=ChannelVoiceMessages.PITCH_BEND)
+            ev.channel = channel
+            ev.setPitchBend(cents)
+            return ev
+
+        timedEvents = [
+            (0, bend(1, 0)),
+            (0, bend(1, 50)),
+            (100, bend(1, -25)),
+        ]
+        self.assertAlmostEqual(getBendAtTick(timedEvents, 1, 0, 2), 50.0, delta=1.0)
+        self.assertAlmostEqual(getBendAtTick(timedEvents, 1, 50, 2), 50.0, delta=1.0)
+        self.assertAlmostEqual(getBendAtTick(timedEvents, 1, 100, 2), -25.0, delta=1.0)
+
+    def testMicrotoneMidiRoundTrip(self):
+        # AI-assisted (Claude)
+        # Every microtone survives an export/import cycle within one cent.
+        centValues = (-196, -150, -75, -50, -25, -1, 1, 25,
+                      33.3333, 50, 75, 100, 149.9, 196)
+        for cents in centValues:
+            with self.subTest(cents=cents):
+                n = note.Note('C4', quarterLength=1)
+                n.pitch.microtone = cents
+                s = stream.Stream()
+                s.append(n)
+                sReturned = midiFileToStream(streamToMidiFile(s))
+                pitchReturned = sReturned.recurse().notes.first().pitch
+                targetPs = 60.0 + cents / 100.0
+                self.assertLess(abs(pitchReturned.ps - targetPs) * 100, 1.0)
+
+    def testMicrotoneMidiRoundTripSequence(self):
+        # AI-assisted (Claude)
+        # Consecutive microtonal notes each keep their own bend rather than
+        # the reset bend emitted at the preceding note's offset.
+        s = stream.Stream()
+        for cents in (50, -25, 75):
+            n = note.Note('D4', quarterLength=1)
+            n.pitch.microtone = cents
+            s.append(n)
+        sReturned = midiFileToStream(streamToMidiFile(s))
+        returned = [n.pitch.ps for n in sReturned.recurse().notes]
+        for actual, expected in zip(returned, (62.5, 61.75, 62.75)):
+            self.assertLess(abs(actual - expected) * 100, 1.0)
+
+    def testTwelveToneMidiRoundTripUnchanged(self):
+        # AI-assisted (Claude)
+        s = stream.Stream()
+        for name in ('C4', 'C#4', 'D-4', 'B3', 'F#5'):
+            s.append(note.Note(name, quarterLength=0.5))
+        referenceBytes = streamToMidiFile(s).writestr()
+        sReturned = midiFileToStream(streamToMidiFile(s))
+        for n in sReturned.recurse().notes:
+            self.assertTrue(n.pitch.isTwelveTone())
+        self.assertEqual(streamToMidiFile(s).writestr(), referenceBytes)
+
+    def testMicrotoneChordMidiRoundTrip(self):
+        # AI-assisted (Claude)
+        c = chord.Chord(['C4', 'E4', 'G4'], quarterLength=1)
+        c.pitches[1].microtone = -33
+        s = stream.Stream()
+        s.append(c)
+        sReturned = midiFileToStream(streamToMidiFile(s))
+        pitches = sReturned.recurse().notes.first().pitches
+        self.assertLess(abs(pitches[1].ps - (64.0 - 0.33)) * 100, 1.0)
+        self.assertEqual(pitches[0].ps, 60.0)
+        self.assertEqual(pitches[2].ps, 67.0)
 
 
 # ------------------------------------------------------------------------------

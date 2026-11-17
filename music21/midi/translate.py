@@ -61,6 +61,9 @@ class TimedNoteEvent(t.NamedTuple):
     onTime: int
     offTime: int
     event: MidiEvent
+    # Pitch-bend in cents active on the note's channel at onTime; zero for
+    # twelve-tone notes or files without bend events.
+    bendCents: float = 0.0
 
 # ------------------------------------------------------------------------------
 class TranslateException(exceptions21.Music21Exception):
@@ -431,7 +434,7 @@ def midiEventsToNote(
         The only supported usage now is two tuples.
     * Changed in v9.7: Expects a single TimedNoteEvent.
     '''
-    tOn, tOff, midiOnEvent = timedNoteEvent
+    tOn, tOff, midiOnEvent, bendCents = timedNoteEvent
 
     returnClass: type[note.Unpitched]|type[note.Note]
     if midiOnEvent.channel == 10:
@@ -448,6 +451,13 @@ def midiEventsToNote(
 
     if isinstance(nr, note.Note):
         nr.pitch.midi = t.cast(int, midiOnEvent.pitch)
+        if bendCents:
+            # The MIDI note number is the nearest semitone; the pitch-bend
+            # wheel carries the microtonal residue.  Reconstruct the sounding
+            # pitch space and let the Pitch split it into Accidental plus
+            # Microtone.  Round to the cent to absorb the wheel's 0.24-cent
+            # quantization.
+            nr.pitch.ps = round(nr.pitch.midi + bendCents / 100.0, 2)
     elif isinstance(nr, note.Unpitched):
         onPitch = t.cast(int, midiOnEvent.pitch)
         nr.storedInstrument = _midiNumberToPercussionInstrument(onPitch)
@@ -655,11 +665,15 @@ def midiEventsToChord(
     # this is a format provided by the Stream conversion of
     # midi events; it pre-groups events for a chord together in nested pairs
     # of abs start time and the event object
-    for _tOn, _tOff, midiOnEvent in timedNoteList:
+    for _tOn, _tOff, midiOnEvent, bendCents in timedNoteList:
         if midiOnEvent.channel == 10:
             any_channel_10 = True
         p = pitch.Pitch()
         p.midi = t.cast(int, midiOnEvent.pitch)
+        if bendCents:
+            # Reconstruct the microtonal residue carried by the pitch-bend
+            # wheel; see midiEventsToNote for the single-note equivalent.
+            p.ps = round(p.midi + bendCents / 100.0, 2)
         pitches.append(p)
         v = volume.Volume(velocity=midiOnEvent.velocity)
         v.velocityIsRelative = False  # velocity is absolute coming from MIDI
@@ -1491,11 +1505,28 @@ def streamToPackets(
 
     # sorting is useful here, as we need these to be in order to assign last
     # instrument
-    packetsByOffset.sort(
-        key=lambda x: (x['offset'], x['midiEvent'].sortOrder)
-    )
+    packetsByOffset.sort(key=_packetSortKey)
     # return packets and stream, as this flat stream should be retained
     return packetsByOffset
+
+
+def _packetSortKey(packet: dict[str, t.Any]) -> tuple[int, int, int]:
+    '''
+    Sort key for MIDI packets: offset first, then the event's
+    :attr:`~music21.midi.base.MidiEvent.sortOrder`, then a tie-breaker that
+    keeps a zero (wheel-reset) PITCH_BEND ahead of a non-zero bend at the
+    same offset.
+
+    The reset belongs to the state *before* the note; the note's own bend is
+    written with the note and must be the last bend at its onset so that
+    importing the file recovers the microtone instead of the reset.
+    '''
+    midiEvent = packet['midiEvent']
+    bendResetFirst = 0
+    if midiEvent.type == ChannelVoiceMessages.PITCH_BEND:
+        # Zero bends sort before non-zero bends; non-bends keep stable order.
+        bendResetFirst = 1 if midiEvent.parameter1 or midiEvent.parameter2 != 64 else 0
+    return packet['offset'], midiEvent.sortOrder, bendResetFirst
 
 
 def assignPacketsToChannels(
@@ -1716,9 +1747,7 @@ def assignPacketsToChannels(
         # environLocal.printDebug(['adding pitch bend for found channels', me])
 
     # this sort is necessary
-    post.sort(
-        key=lambda x_event: (x_event['offset'], x_event['midiEvent'].sortOrder)
-    )
+    post.sort(key=_packetSortKey)
 
     # TODO: for each track, add an additional silent event to make sure
     # entire duration gets played
@@ -1916,8 +1945,8 @@ def getNotesFromEvents(
     >>> len(notes)
     2
     >>> notes
-    [TimedNoteEvent(onTime=0, offTime=3, event=<music21.midi.MidiEvent NOTE_ON...>),
-     TimedNoteEvent(onTime=1, offTime=2, event=<music21.midi.MidiEvent NOTE_ON...>)]
+    [TimedNoteEvent(onTime=0, offTime=3, event=<music21.midi.MidiEvent NOTE_ON...>, bendCents=0.0),
+     TimedNoteEvent(onTime=1, offTime=2, event=<music21.midi.MidiEvent NOTE_ON...>, bendCents=0.0)]
     >>> (notes[0].event.pitch, notes[1].event.pitch)
     (60, 62)
     '''
@@ -1955,6 +1984,145 @@ def getNotesFromEvents(
 
     # could also raise a warning on note offs without a note on.
     return notes[::-1]  # back to increasing order.
+
+
+# MIDI continuous controller numbers used in Registered Parameter Number
+# (RPN) exchanges.  A bend range is declared by selecting RPN 0,0
+# (pitch-bend sensitivity) and then sending data-entry MSB/LSB messages.
+_CC_DATA_ENTRY_MSB = 6
+_CC_DATA_ENTRY_LSB = 38
+_CC_RPN_MSB = 101
+_CC_RPN_LSB = 100
+_DEFAULT_BEND_RANGE = 2.0
+
+
+def getBendRangesFromEvents(
+    timedEvents: list[tuple[int, MidiEvent]],
+) -> dict[int, float]:
+    # noinspection PyShadowingNames
+    '''
+    Scan timed MIDI events for RPN pitch-bend-sensitivity declarations and
+    return the bend range in semitones for each (1-indexed) channel.
+
+    Channels without a declaration are absent from the dictionary; callers
+    fall back to the GM default range of two semitones.
+
+    >>> CVM = midi.ChannelVoiceMessages
+    >>> def cc(channel, controller, value):
+    ...     ev = midi.MidiEvent(type=CVM.CONTROLLER_CHANGE)
+    ...     ev.channel = channel
+    ...     ev.parameter1 = controller
+    ...     ev.parameter2 = value
+    ...     return ev
+    >>> events = [
+    ...     (0, cc(1, 101, 0)),
+    ...     (0, cc(1, 100, 0)),
+    ...     (0, cc(1, 6, 4)),    # four semitone range
+    ...     (0, cc(1, 38, 0)),
+    ...     (10, cc(2, 101, 0)),
+    ...     (10, cc(2, 100, 0)),
+    ...     (10, cc(2, 6, 12)),
+    ...     (10, cc(2, 38, 50)),  # plus 50/100 of a semitone
+    ... ]
+    >>> from music21.midi.translate import getBendRangesFromEvents
+    >>> getBendRangesFromEvents(events)
+    {1: 4.0, 2: 12.5}
+
+    * New in v11.
+
+    AI-assisted (Claude)
+    '''
+    # The last controller selected on each channel while an RPN is open.
+    selectedRpn: dict[int, tuple[int|None, int|None]] = {}
+    pendingData: dict[int, tuple[int|None, int|None]] = {}
+    bendRanges: dict[int, float] = {}
+
+    for _tick, event in timedEvents:
+        if event.type != ChannelVoiceMessages.CONTROLLER_CHANGE:
+            continue
+        channel = event.channel
+        controller = event.parameter1
+        value = event.parameter2
+        if not isinstance(controller, int) or not isinstance(value, int):
+            continue
+
+        if controller == _CC_RPN_MSB:
+            _msb, lsb = selectedRpn.get(channel, (None, None))
+            selectedRpn[channel] = (value, lsb)
+        elif controller == _CC_RPN_LSB:
+            msb, _lsb = selectedRpn.get(channel, (None, None))
+            selectedRpn[channel] = (msb, value)
+        elif controller == _CC_DATA_ENTRY_MSB:
+            _msb, lsb = pendingData.get(channel, (None, None))
+            pendingData[channel] = (value, lsb)
+        elif controller == _CC_DATA_ENTRY_LSB:
+            msb, _lsb = pendingData.get(channel, (None, None))
+            pendingData[channel] = (msb, value)
+
+        # A complete data-entry pair only makes sense with a selected RPN.
+        rpn = selectedRpn.get(channel)
+        data = pendingData.get(channel)
+        if rpn == (0, 0) and data is not None and data[0] is not None and data[1] is not None:
+            # MSB is whole semitones; LSB is fractions of a semitone.
+            bendRanges[channel] = data[0] + data[1] / 100.0
+            pendingData.pop(channel, None)
+
+    return bendRanges
+
+
+def getBendAtTick(
+    timedEvents: list[tuple[int, MidiEvent]],
+    channel: int,
+    tick: int,
+    bendRange: int|float,
+) -> float:
+    # noinspection PyShadowingNames
+    '''
+    Return the pitch-bend value in cents active on `channel` at `tick`.
+
+    The bend written at the same tick as a note onset applies to that note,
+    so the *last* same-tick PITCH_BEND (the one immediately preceding the
+    NOTE_ON in the byte stream) wins; a wheel-reset placed earlier at the
+    same tick does not clobber it.  If no bend shares the tick, the most
+    recent earlier bend is used.  With no bend event at or before the tick
+    the wheel is centered, so zero is returned.
+
+    >>> CVM = midi.ChannelVoiceMessages
+    >>> def bend(channel, cents):
+    ...     ev = midi.MidiEvent(type=CVM.PITCH_BEND)
+    ...     ev.channel = channel
+    ...     ev.setPitchBend(cents)
+    ...     return ev
+    >>> events = [(0, bend(1, 0)), (0, bend(1, 50)), (100, bend(1, -25))]
+    >>> from music21.midi.translate import getBendAtTick
+    >>> round(getBendAtTick(events, 1, 0, 2), 1)
+    50.0
+    >>> round(getBendAtTick(events, 1, 100, 2), 1)
+    -25.0
+    >>> round(getBendAtTick(events, 1, 50, 2), 1)
+    50.0
+
+    * New in v11.
+
+    AI-assisted (Claude)
+    '''
+    currentCents = 0.0
+    exactTickCents: float|None = None
+    for eventTick, event in timedEvents:
+        if eventTick > tick:
+            break
+        if (event.type == ChannelVoiceMessages.PITCH_BEND
+                and event.channel == channel):
+            bendCents = event.getPitchBend(bendRange)
+            if eventTick == tick:
+                # Overwrite: the last same-tick bend sits closest to the
+                # NOTE_ON and therefore belongs to this note.
+                exactTickCents = bendCents
+            else:
+                currentCents = bendCents
+    if exactTickCents is not None:
+        return exactTickCents
+    return currentCents
 
 
 def lyricTimingsFromEvents(
@@ -2124,6 +2292,8 @@ def midiTrackToStream(
 
     * Changed in v7: Now makes measures.
     * Changed in v8: all but the first attribute are keyword only.
+    * Changed in v11: PITCH_BEND events (and RPN-declared bend ranges) are
+      now read back into the notes' microtones instead of being ignored.
     '''
     # environLocal.printDebug(['midiTrackToStream(): got midi track: events',
     # len(mt.events), 'ticksPerQuarter', ticksPerQuarter])
@@ -2138,6 +2308,25 @@ def midiTrackToStream(
 
     # need to build chords and notes
     notes: list[TimedNoteEvent] = getNotesFromEvents(timedEvents)
+    # Pitch bends are channel-wide state: resolve the bend range declared by
+    # RPN messages (default two semitones) and the bend at each note's start.
+    bendRanges = getBendRangesFromEvents(timedEvents)
+    hasBendEvents = any(
+        event.type == ChannelVoiceMessages.PITCH_BEND
+        for _tick, event in timedEvents
+    )
+    if hasBendEvents:
+        notes = [
+            timedNoteEvent._replace(
+                bendCents=getBendAtTick(
+                    timedEvents,
+                    timedNoteEvent.event.channel,
+                    timedNoteEvent.onTime,
+                    bendRanges.get(
+                        timedNoteEvent.event.channel, _DEFAULT_BEND_RANGE),
+                ))
+            for timedNoteEvent in notes
+        ]
     metaEvents = getMetaEvents(timedEvents, encoding=encoding)
     lyricsDict = lyricTimingsFromEvents(timedEvents, encoding=encoding)
 

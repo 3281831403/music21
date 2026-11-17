@@ -758,6 +758,63 @@ class MidiEvent(prebase.ProtoM21Object):
         self.parameter1 = d2
         self.parameter2 = d1  # d1 is the most significant byte here
 
+    def getPitchBend(self, bendRange: int|float = 2) -> float:
+        '''
+        Return the bend value in cents represented by this PITCH_BEND
+        event's ``.parameter1`` (least significant byte) and
+        ``.parameter2`` (most significant byte).
+
+        This is the inverse of :meth:`setPitchBend`.  The `bendRange`
+        parameter gives the number of half steps spanned by the full bend
+        range, matching the RPN pitch-bend-sensitivity declaration of the
+        device that wrote the file; it defaults to the GM standard of two
+        semitones.
+
+        >>> mt = midi.MidiTrack(1)
+        >>> me1 = midi.MidiEvent(mt, type=midi.ChannelVoiceMessages.PITCH_BEND)
+        >>> me1.setPitchBend(50)
+        >>> round(me1.getPitchBend(), 1)
+        50.0
+        >>> me1.setPitchBend(-196)
+        >>> round(me1.getPitchBend(), 1)
+        -196.0
+        >>> me1.setPitchBend(0)
+        >>> me1.getPitchBend()
+        0.0
+
+        A bend written against a non-default range is read back with the
+        same range:
+
+        >>> me1.setPitchBend(-300, bendRange=4)
+        >>> round(me1.getPitchBend(bendRange=4), 1)
+        -300.0
+
+        The MIDI bend resolution at the default two-semitone range is about
+        0.24 cents per step:
+
+        >>> me1.setPitchBend(1)
+        >>> round(me1.getPitchBend(), 2)
+        1.0
+
+        * New in v11: pitch bend events can now be decoded back to cents.
+
+        AI-assisted (Claude)
+        '''
+        center = 0x2000
+        topSpan = 0x4000 - 1 - center
+        bottomSpan = center
+        # Pitch-bend events always carry two integer data bytes; guard the
+        # union-typed parameters for the type checker anyway.
+        if not isinstance(self.parameter1, int) or not isinstance(self.parameter2, int):
+            return 0.0
+        target = (self.parameter2 << 7) + self.parameter1 - center
+
+        centRange = bendRange * 100
+        if target >= 0:
+            return target / topSpan * centRange
+        else:
+            return target / bottomSpan * centRange
+
     def parseChannelVoiceMessage(self, midiBytes: bytes) -> bytes:
         r'''
         Take a set of bytes that represent a ChannelVoiceMessage and set the

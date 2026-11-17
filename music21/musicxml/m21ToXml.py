@@ -4603,12 +4603,33 @@ class MeasureExporter(XMLExporterBase):
           <alter>1</alter>
           <octave>5</octave>
         </pitch>
+
+        Fractional alterations, including those supplied by a
+        :class:`~music21.pitch.Microtone`, are written with their full
+        decimal value instead of being rounded or dropped:
+
+        >>> p = pitch.Pitch('C4')
+        >>> p.microtone = 50
+        >>> MEX.dump(MEX.pitchToXml(p))
+        <pitch>
+          <step>C</step>
+          <alter>0.5</alter>
+          <octave>4</octave>
+        </pitch>
+
+        * Changed in v11: the <alter> tag combines the accidental and the
+          microtone, so microtone-only pitches are no longer exported without
+          an alteration.
         '''
         mxPitch = Element('pitch')
         _setTagTextFromAttribute(p, mxPitch, 'step', 'step')
-        if p.accidental is not None:
+        # Pitch.alter combines the Accidental alter with the Microtone, so a
+        # pitch carrying only a microtone still gets an <alter> tag and any
+        # fractional value survives the round trip exactly.
+        if p.accidental is not None or (p._microtone is not None
+                                        and p._microtone.cents != 0):
             mxAlter = SubElement(mxPitch, 'alter')
-            mxAlter.text = str(common.numToIntOrFloat(p.accidental.alter))
+            mxAlter.text = str(common.numToIntOrFloat(p.alter))
         _setTagTextFromAttribute(
             p, mxPitch, 'octave',
             transform=lambda o: moveOctaveIntoMusicxmlRange(o, p.nameWithOctave))
